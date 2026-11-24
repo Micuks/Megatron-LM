@@ -6,7 +6,7 @@ import importlib
 import weakref
 from contextlib import nullcontext
 from functools import wraps
-from typing import List, Optional, Union
+from typing import List, Optional, Sequence, Union
 
 import torch
 
@@ -62,6 +62,24 @@ try:
 except (ImportError, ModuleNotFoundError):
     # MXFP8Tensor not found
     HAVE_TE_MXFP8TENSOR = False
+
+# Check if Transformer Engine has Float8BlockwiseQTensorStorage / Float8BlockwiseQTensor class
+try:
+    from transformer_engine.pytorch.tensor.storage.float8_blockwise_tensor_storage import (
+        Float8BlockwiseQTensorStorage,
+    )
+
+    HAVE_TE_BLOCKWISE_FP8TENSOR = True
+except (ImportError, ModuleNotFoundError):
+    try:
+        from transformer_engine.pytorch.tensor.float8_blockwise_tensor import (
+            Float8BlockwiseQTensor as Float8BlockwiseQTensorStorage,
+        )
+
+        HAVE_TE_BLOCKWISE_FP8TENSOR = True
+    except (ImportError, ModuleNotFoundError):
+        Float8BlockwiseQTensorStorage = None
+        HAVE_TE_BLOCKWISE_FP8TENSOR = False
 
 try:
     from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor
@@ -135,6 +153,13 @@ def is_float8tensor(tensor: torch.Tensor) -> bool:
 def is_mxfp8tensor(tensor: torch.Tensor) -> bool:
     """Check if a tensor is a Transformer Engine MXFP8Tensor"""
     return HAVE_TE_MXFP8TENSOR and _is_instance_or_param_data(tensor, MXFP8Tensor)
+
+
+def is_blockwise_float8tensor(tensor: torch.Tensor) -> bool:
+    """Check if a tensor is a Transformer Engine blockwise FP8 tensor."""
+    return HAVE_TE_BLOCKWISE_FP8TENSOR and _is_instance_or_param_data(
+        tensor, Float8BlockwiseQTensorStorage
+    )
 
 
 def is_grouped_tensor(tensor: torch.Tensor) -> bool:
@@ -702,21 +727,190 @@ def correct_amax_history_if_needed(model: List[torch.nn.Module]):
     _correct_amax_history_if_needed_impl(model)
 
 
-def post_all_gather_processing(model_params):
+#: Attribute marking an FP8 quantized parameter (or quantized ``GroupedTensor``)
+#: as rowwise-only so :func:`post_all_gather_processing` skips materializing
+#: persistent columnwise / transposed weight copies after parameter all-gather.
+#: Prefer :func:`set_fp8_param_rowwise_only` and :func:`is_fp8_param_rowwise_only`
+#: over accessing this attribute directly.
+FP8_PARAM_ROWWISE_ONLY_ATTR = "fp8_param_rowwise_only"
+
+
+def is_fp8_param_rowwise_only(param: torch.Tensor) -> bool:
+    """Return whether ``param`` opts out of post-all-gather columnwise/transpose copies.
+
+    A parameter is treated as rowwise-only when :data:`FP8_PARAM_ROWWISE_ONLY_ATTR`
+    is truthy on ``param`` (or, if unset on ``param``, on its unwrapped tensor data).
+    """
+    flag = getattr(param, FP8_PARAM_ROWWISE_ONLY_ATTR, None)
+    if flag is not None:
+        return bool(flag)
+    unwrapped = _unwrap_parameter_data(param)
+    if unwrapped is not param:
+        return bool(getattr(unwrapped, FP8_PARAM_ROWWISE_ONLY_ATTR, False))
+    return False
+
+
+def _release_tensor_attr(owner: object, attr: str) -> bool:
+    """Clear an optional tensor attribute without mutating its storage in place."""
+    value = getattr(owner, attr, None)
+    if value is None:
+        return False
+    if getattr(value, "is_cuda", False):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Cannot release FP8 columnwise/transposed storage during CUDA graph capture."
+            )
+        value.record_stream(torch.cuda.current_stream(getattr(value, "device", None)))
+    setattr(owner, attr, None)
+    return True
+
+
+def release_fp8_columnwise_storage(param: torch.Tensor) -> bool:
+    """Release derivable columnwise/transposed storage from an FP8 weight parameter.
+
+    Only releases redundant copies that can be reconstructed from rowwise storage
+    (2-D block-scaled ``Float8BlockwiseQTensor`` columnwise data/scales and
+    tensorwise/delayed ``Float8Tensor`` transpose caches). Non-derivable formats
+    such as MXFP8 and NVFP4 are left untouched.
+
+    Releases references without mutating underlying storage in place and calls
+    ``record_stream`` on released CUDA tensors so live autograd aliases and
+    in-flight kernels remain safe.
+
+    Args:
+        param: Parameter or quantized tensor to release columnwise/transposed storage from.
+
+    Returns:
+        ``True`` if any columnwise or transposed buffer was released, ``False`` otherwise.
+    """
+    if is_grouped_tensor_with_quantized_storage(param):
+        if is_grouped_mxfp8tensor(param):
+            return False
+        recipe = _get_grouped_quantized_recipe(param)
+        if recipe is not None and callable(getattr(recipe, "nvfp4", None)) and recipe.nvfp4():
+            return False
+        grouped = _unwrap_parameter_data(param)
+        if getattr(grouped, "rowwise_data", None) is None:
+            return False
+
+        released = False
+        members = getattr(grouped, "quantized_tensors", None)
+        if members is not None:
+            for member in members:
+                if release_fp8_columnwise_storage(member):
+                    released = True
+
+        is_blockwise_grouped = (
+            recipe is not None
+            and callable(getattr(recipe, "float8_block_scaling", None))
+            and recipe.float8_block_scaling()
+        )
+        if not is_blockwise_grouped and members:
+            is_blockwise_grouped = all(
+                is_blockwise_float8tensor(m) and getattr(m, "_is_2D_scaled", False) for m in members
+            )
+        if is_blockwise_grouped:
+            for attr in ("columnwise_data", "columnwise_scale_inv"):
+                if _release_tensor_attr(grouped, attr):
+                    released = True
+        return released
+
+    if is_mxfp8tensor(param):
+        return False
+
+    if is_blockwise_float8tensor(param):
+        target = (
+            param
+            if isinstance(param, Float8BlockwiseQTensorStorage)
+            else _unwrap_parameter_data(param)
+        )
+        if not getattr(target, "_is_2D_scaled", False):
+            return False
+        if getattr(target, "_rowwise_data", None) is None:
+            return False
+        released = False
+        for attr in ("_columnwise_data", "_columnwise_scale_inv"):
+            if _release_tensor_attr(target, attr):
+                released = True
+        return released
+
+    if is_float8tensor(param):
+        target = (
+            param
+            if HAVE_TE_FP8_TENSOR_CLASS and isinstance(param, FP8_TENSOR_CLASS)
+            else _unwrap_parameter_data(param)
+        )
+        if getattr(target, "_data", None) is None or not hasattr(target, "_transpose_invalid"):
+            return False
+        released = _release_tensor_attr(target, "_transpose")
+        if released:
+            target._transpose_invalid = True
+        return released
+
+    return False
+
+
+def set_fp8_param_rowwise_only(
+    param: torch.Tensor, rowwise_only: bool = True, *, release_columnwise: bool = False
+) -> None:
+    """Mark ``param`` as rowwise-only for :func:`post_all_gather_processing`.
+
+    Rowwise-only parameters (e.g. weights consumed by custom rowwise megakernels,
+    fused MoE backends, or on-demand columnwise rematerialization wrappers) opt out
+    of persistent post-all-gather columnwise/transposed weight copies.
+
+    Args:
+        param: Parameter or quantized tensor (including a quantized ``GroupedTensor``)
+            to annotate.
+        rowwise_only: Whether to skip post-all-gather columnwise/transpose copies.
+        release_columnwise: If ``True`` (requires ``rowwise_only=True``), also
+            release any currently materialized derivable columnwise/transposed
+            storage via :func:`release_fp8_columnwise_storage`.
+    """
+    if release_columnwise and not rowwise_only:
+        raise ValueError("release_columnwise=True requires rowwise_only=True.")
+
+    flag = bool(rowwise_only)
+    setattr(param, FP8_PARAM_ROWWISE_ONLY_ATTR, flag)
+    if is_grouped_tensor_with_quantized_storage(param):
+        members = getattr(_unwrap_parameter_data(param), "quantized_tensors", None)
+        if members is not None:
+            for member in members:
+                setattr(member, FP8_PARAM_ROWWISE_ONLY_ATTR, flag)
+
+    if release_columnwise:
+        release_fp8_columnwise_storage(param)
+
+
+def post_all_gather_processing(model_params: Union[torch.Tensor, Sequence[torch.Tensor]]) -> None:
     """
     Post-processing after all-gather for weights in distributed optimizer.
     - tensorwise: may need to create a transposed view to match backend GEMM.
     - blockwise: create column-wise storage.
+
+    Parameters marked via :func:`set_fp8_param_rowwise_only` (including whole
+    quantized ``GroupedTensor`` parameters or individual grouped members) are
+    skipped so rowwise-only consumers avoid persistent columnwise copies and
+    redundant transpose kernels.
     """
-    if not isinstance(model_params, list):
+    if not isinstance(model_params, (list, tuple)):
         model_params = [model_params]
 
     expanded_model_params = []
     for param in model_params:
         if is_grouped_tensor_with_quantized_storage(param):
-            expanded_model_params.extend(get_grouped_quantized_members(param))
-        else:
+            if is_fp8_param_rowwise_only(param):
+                continue
+            expanded_model_params.extend(
+                member
+                for member in get_grouped_quantized_members(param)
+                if not is_fp8_param_rowwise_only(member)
+            )
+        elif not is_fp8_param_rowwise_only(param):
             expanded_model_params.append(param)
+
+    if not expanded_model_params:
+        return
 
     if te_post_all_gather_processing is not None:
         te_post_all_gather_processing(expanded_model_params)

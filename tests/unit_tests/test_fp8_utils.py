@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -20,9 +21,26 @@ try:
 except ImportError:
     HAVE_MXFP8_TENSOR = False
 
+try:
+    from transformer_engine.pytorch.tensor.float8_blockwise_tensor import Float8BlockQuantizer
+
+    HAVE_BLOCKWISE_FP8_TENSOR = True
+except ImportError:
+    HAVE_BLOCKWISE_FP8_TENSOR = False
+
 # MXFP8 needs Blackwell or newer.
 mxfp8_available = HAVE_MXFP8_TENSOR and get_device_arch_version() >= 10
 reason_for_no_mxfp8 = "MXFP8 requires Transformer Engine and device arch >= 10"
+
+blockwise_fp8_available = (
+    HAVE_BLOCKWISE_FP8_TENSOR
+    and fp8_utils.te_post_all_gather_processing is not None
+    and torch.cuda.is_available()
+    and get_device_arch_version() >= 9
+)
+reason_for_no_blockwise_fp8 = (
+    "Blockwise FP8 post_all_gather_processing requires Transformer Engine and device arch >= 9"
+)
 
 
 @pytest.mark.skipif(not fp8_utils.HAVE_TE, reason="Transformer Engine is not installed")
@@ -271,3 +289,297 @@ class TestCopyTensorsToQuantizedParams:
     def test_empty_input(self):
         """No params is a no-op rather than an error."""
         fp8_utils.copy_tensors_to_quantized_params([], [])
+
+
+class _FakeCudaBuffer:
+    """Minimal stand-in for a CUDA tensor supporting record_stream."""
+
+    def __init__(self, device="cuda:0"):
+        self.is_cuda = True
+        self.device = device
+        self.streams = []
+
+    def record_stream(self, stream):
+        self.streams.append(stream)
+
+
+class _FakeBlockwiseWeight:
+    """Minimal stand-in for a TE Float8BlockwiseQTensorStorage weight."""
+
+    def __init__(self, *, is_2d=True, has_rowwise=True, has_col=True, has_col_scale=True):
+        self._is_2D_scaled = is_2d
+        self._rowwise_data = _FakeCudaBuffer() if has_rowwise else None
+        self._rowwise_scale_inv = _FakeCudaBuffer() if has_rowwise else None
+        self._columnwise_data = _FakeCudaBuffer() if has_col else None
+        self._columnwise_scale_inv = _FakeCudaBuffer() if has_col_scale else None
+
+
+class _FakeTensorwiseWeight:
+    """Minimal stand-in for a TE tensorwise/delayed Float8Tensor weight."""
+
+    def __init__(self, *, has_data=True, has_transpose=True):
+        self._data = _FakeCudaBuffer() if has_data else None
+        self._transpose = _FakeCudaBuffer() if has_transpose else None
+        self._transpose_invalid = not has_transpose
+
+
+class _FakeMXFP8Weight:
+    """Minimal stand-in for a TE MXFP8Tensor weight."""
+
+    def __init__(self):
+        self._rowwise_data = _FakeCudaBuffer()
+        self._rowwise_scale_inv = _FakeCudaBuffer()
+        self._columnwise_data = _FakeCudaBuffer()
+        self._columnwise_scale_inv = _FakeCudaBuffer()
+
+
+class _FakeGroupedWeight:
+    """Minimal stand-in for a TE quantized GroupedTensor weight."""
+
+    def __init__(self, members=None, recipe=None, *, has_rowwise=True):
+        self.rowwise_data = SimpleNamespace(dtype=torch.uint8) if has_rowwise else None
+        self.columnwise_data = _FakeCudaBuffer()
+        self.columnwise_scale_inv = _FakeCudaBuffer()
+        self.quantized_tensors = members
+        self.quantizer = (
+            SimpleNamespace(_get_compatible_recipe=lambda: recipe) if recipe is not None else None
+        )
+
+
+class TestFP8RowwiseOnlyPostAllGather:
+    """Unit tests for rowwise-only FP8 parameter metadata and post-all-gather filtering."""
+
+    def _patch_fake_te_types(self, monkeypatch):
+        monkeypatch.setattr(fp8_utils, "HAVE_TE_BLOCKWISE_FP8TENSOR", True)
+        monkeypatch.setattr(
+            fp8_utils, "Float8BlockwiseQTensorStorage", _FakeBlockwiseWeight, raising=False
+        )
+        monkeypatch.setattr(fp8_utils, "HAVE_TE_MXFP8TENSOR", True)
+        monkeypatch.setattr(fp8_utils, "MXFP8Tensor", _FakeMXFP8Weight, raising=False)
+        monkeypatch.setattr(fp8_utils, "HAVE_TE_FP8_TENSOR_CLASS", True)
+        monkeypatch.setattr(fp8_utils, "FP8_TENSOR_CLASS", _FakeTensorwiseWeight, raising=False)
+        monkeypatch.setattr(fp8_utils, "HAVE_TE_GROUPED_TENSOR_CLASS", True)
+        monkeypatch.setattr(fp8_utils, "GroupedTensor", _FakeGroupedWeight, raising=False)
+
+    def test_post_all_gather_skips_rowwise_only_params(self, monkeypatch):
+        """Rowwise-only parameters are excluded from te_post_all_gather_processing."""
+        tagged_a, tagged_b, normal = (
+            _FakeBlockwiseWeight(),
+            _FakeBlockwiseWeight(),
+            _FakeBlockwiseWeight(),
+        )
+        fp8_utils.set_fp8_param_rowwise_only(tagged_a)
+        fp8_utils.set_fp8_param_rowwise_only(tagged_b)
+
+        captured = []
+        monkeypatch.setattr(fp8_utils, "te_post_all_gather_processing", captured.append)
+
+        fp8_utils.post_all_gather_processing([tagged_a, normal])
+        assert captured == [[normal]]
+
+        fp8_utils.post_all_gather_processing((tagged_a, normal))
+        assert captured[-1] == [normal]
+
+        # When every parameter in the call is rowwise-only, TE is not invoked at all.
+        fp8_utils.post_all_gather_processing([tagged_a, tagged_b])
+        fp8_utils.post_all_gather_processing(tagged_a)
+        assert len(captured) == 2
+
+    def test_post_all_gather_grouped_container_and_member_filtering(self, monkeypatch):
+        """Both whole GroupedTensor and individual grouped members can opt out."""
+        self._patch_fake_te_types(monkeypatch)
+        m0, m1 = _FakeBlockwiseWeight(), _FakeBlockwiseWeight()
+        grouped = _FakeGroupedWeight(members=[m0, m1])
+        normal = _FakeBlockwiseWeight()
+
+        captured = []
+        monkeypatch.setattr(fp8_utils, "te_post_all_gather_processing", captured.append)
+
+        # Member-level opt-out skips only the tagged member.
+        fp8_utils.set_fp8_param_rowwise_only(m0)
+        fp8_utils.post_all_gather_processing([grouped, normal])
+        assert captured == [[m1, normal]]
+
+        # Container-level opt-out skips the whole GroupedTensor without touching members.
+        fp8_utils.set_fp8_param_rowwise_only(grouped, True)
+        assert fp8_utils.is_fp8_param_rowwise_only(grouped)
+        assert fp8_utils.is_fp8_param_rowwise_only(m0)
+        assert fp8_utils.is_fp8_param_rowwise_only(m1)
+        monkeypatch.setattr(
+            fp8_utils,
+            "get_grouped_quantized_members",
+            Mock(side_effect=AssertionError("should not expand rowwise-only grouped container")),
+        )
+        fp8_utils.post_all_gather_processing([grouped, normal])
+        assert captured[-1] == [normal]
+
+        # Unmarking clears the container and cached members so normal processing resumes.
+        fp8_utils.set_fp8_param_rowwise_only(grouped, False)
+        assert not fp8_utils.is_fp8_param_rowwise_only(grouped)
+        assert not fp8_utils.is_fp8_param_rowwise_only(m0)
+        assert not fp8_utils.is_fp8_param_rowwise_only(m1)
+
+    def test_set_rowwise_only_validation_and_toggle(self):
+        """Invalid arguments raise ValueError and toggling False overrides unwrapped attrs."""
+        param = nn.Parameter(torch.zeros(4, 4))
+        with pytest.raises(ValueError, match="release_columnwise=True requires rowwise_only=True"):
+            fp8_utils.set_fp8_param_rowwise_only(param, False, release_columnwise=True)
+
+        assert not fp8_utils.is_fp8_param_rowwise_only(param)
+        setattr(param.data, fp8_utils.FP8_PARAM_ROWWISE_ONLY_ATTR, True)
+        assert fp8_utils.is_fp8_param_rowwise_only(param)
+
+        fp8_utils.set_fp8_param_rowwise_only(param, False)
+        assert not fp8_utils.is_fp8_param_rowwise_only(param)
+
+        fp8_utils.set_fp8_param_rowwise_only(param, True)
+        assert fp8_utils.is_fp8_param_rowwise_only(param)
+        assert getattr(param, fp8_utils.FP8_PARAM_ROWWISE_ONLY_ATTR) is True
+
+    def test_release_blockwise_2d_records_stream_and_is_idempotent(self, monkeypatch):
+        """Releasing 2-D blockwise columns records the current CUDA stream and is idempotent."""
+        self._patch_fake_te_types(monkeypatch)
+        stream = object()
+        stream_calls = []
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+        monkeypatch.setattr(
+            torch.cuda, "current_stream", lambda device=None: stream_calls.append(device) or stream
+        )
+
+        weight = _FakeBlockwiseWeight()
+        col_data, col_scale = weight._columnwise_data, weight._columnwise_scale_inv
+        row_data, row_scale = weight._rowwise_data, weight._rowwise_scale_inv
+
+        fp8_utils.set_fp8_param_rowwise_only(weight, True, release_columnwise=True)
+        assert fp8_utils.is_fp8_param_rowwise_only(weight)
+        assert weight._columnwise_data is None
+        assert weight._columnwise_scale_inv is None
+        assert weight._rowwise_data is row_data
+        assert weight._rowwise_scale_inv is row_scale
+        assert col_data.streams == [stream]
+        assert col_scale.streams == [stream]
+        assert len(stream_calls) == 2
+
+        # Second release is a no-op and does not query current_stream again.
+        assert fp8_utils.release_fp8_columnwise_storage(weight) is False
+        assert len(stream_calls) == 2
+
+    def test_release_guards_non_derivable_and_invalid_tensors(self, monkeypatch):
+        """MXFP8, NVFP4, 1-D blockwise, missing-rowwise, and plain tensors are never released."""
+        self._patch_fake_te_types(monkeypatch)
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: object())
+
+        one_dim_blockwise = _FakeBlockwiseWeight(is_2d=False)
+        missing_rowwise = _FakeBlockwiseWeight(has_rowwise=False)
+        mxfp8 = _FakeMXFP8Weight()
+        grouped_mxfp8 = _FakeGroupedWeight(
+            members=[_FakeMXFP8Weight()],
+            recipe=SimpleNamespace(mxfp8=lambda: True, nvfp4=lambda: False),
+        )
+        grouped_nvfp4 = _FakeGroupedWeight(
+            members=[_FakeBlockwiseWeight()],
+            recipe=SimpleNamespace(mxfp8=lambda: False, nvfp4=lambda: True),
+        )
+        plain = nn.Parameter(torch.zeros(4, 4))
+
+        for tensor in (
+            one_dim_blockwise,
+            missing_rowwise,
+            mxfp8,
+            grouped_mxfp8,
+            grouped_nvfp4,
+            plain,
+        ):
+            assert fp8_utils.release_fp8_columnwise_storage(tensor) is False
+
+        assert one_dim_blockwise._columnwise_data is not None
+        assert missing_rowwise._columnwise_data is not None
+        assert mxfp8._columnwise_data is not None
+        assert grouped_mxfp8.columnwise_data is not None
+        assert grouped_mxfp8.quantized_tensors[0]._columnwise_data is not None
+        assert grouped_nvfp4.columnwise_data is not None
+        assert grouped_nvfp4.quantized_tensors[0]._columnwise_data is not None
+
+    def test_release_tensorwise_transpose_cache(self, monkeypatch):
+        """Tensorwise Float8Tensor transpose cache is cleared and marked invalid."""
+        self._patch_fake_te_types(monkeypatch)
+        stream = object()
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: stream)
+
+        weight = _FakeTensorwiseWeight()
+        old_transpose = weight._transpose
+
+        assert fp8_utils.release_fp8_columnwise_storage(weight) is True
+        assert weight._transpose is None
+        assert weight._transpose_invalid is True
+        assert old_transpose.streams == [stream]
+        assert fp8_utils.release_fp8_columnwise_storage(weight) is False
+
+    def test_release_grouped_blockwise_releases_container_and_members(self, monkeypatch):
+        """Grouped 2-D blockwise release drops both member and container columnwise storage."""
+        self._patch_fake_te_types(monkeypatch)
+        stream = object()
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: stream)
+
+        m0, m1 = _FakeBlockwiseWeight(), _FakeBlockwiseWeight()
+        grouped = _FakeGroupedWeight(
+            members=[m0, m1],
+            recipe=SimpleNamespace(
+                mxfp8=lambda: False, nvfp4=lambda: False, float8_block_scaling=lambda: True
+            ),
+        )
+        container_col, container_scale = grouped.columnwise_data, grouped.columnwise_scale_inv
+
+        assert fp8_utils.release_fp8_columnwise_storage(grouped) is True
+        assert grouped.columnwise_data is None
+        assert grouped.columnwise_scale_inv is None
+        assert container_col.streams == [stream]
+        assert container_scale.streams == [stream]
+        for member in (m0, m1):
+            assert member._columnwise_data is None
+            assert member._columnwise_scale_inv is None
+
+    def test_release_during_cuda_graph_capture_raises(self, monkeypatch):
+        """Releasing CUDA columnwise storage inside CUDA graph capture is rejected."""
+        self._patch_fake_te_types(monkeypatch)
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+        weight = _FakeBlockwiseWeight()
+        with pytest.raises(RuntimeError, match="CUDA graph capture"):
+            fp8_utils.release_fp8_columnwise_storage(weight)
+        assert weight._columnwise_data is not None
+
+    @pytest.mark.skipif(not blockwise_fp8_available, reason=reason_for_no_blockwise_fp8)
+    def test_blockwise_real_te_rowwise_only_skips_columnwise_materialization(self):
+        """End-to-end TE check: rowwise-only blockwise weight stays column-free after gather."""
+        torch.manual_seed(0)
+        quantizer = Float8BlockQuantizer(
+            fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True, block_scaling_dim=2
+        )
+        src_a = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+        src_b = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+        rowwise_param = nn.Parameter(quantizer(src_a), requires_grad=True)
+        normal_param = nn.Parameter(quantizer(src_b), requires_grad=True)
+        expected_dequant = rowwise_param.dequantize().clone()
+
+        fp8_utils.set_fp8_param_rowwise_only(rowwise_param, True, release_columnwise=True)
+        assert rowwise_param._columnwise_data is None
+        assert rowwise_param._columnwise_scale_inv is None
+        assert rowwise_param._rowwise_data is not None
+
+        # Drop normal_param's columnwise buffers without marking it rowwise-only,
+        # then verify post_all_gather_processing rebuilds only normal_param.
+        assert fp8_utils.release_fp8_columnwise_storage(normal_param) is True
+        assert normal_param._columnwise_data is None
+
+        fp8_utils.post_all_gather_processing([rowwise_param, normal_param])
+        torch.cuda.synchronize()
+
+        assert rowwise_param._columnwise_data is None
+        assert rowwise_param._columnwise_scale_inv is None
+        assert torch.equal(rowwise_param.dequantize(), expected_dequant)
+        assert normal_param._columnwise_data is not None
+        assert normal_param._columnwise_scale_inv is not None
